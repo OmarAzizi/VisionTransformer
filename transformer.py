@@ -1,160 +1,230 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from random import random
+from torchvision.transforms import Resize, ToTensor
+from torchvision.transforms.functional import to_pil_image
+
+to_tensor = [Resize((144, 144)), ToTensor()]
+
+class Compose(object):
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, image, target):
+        for t in self.transforms:
+            image = t(image)
+        return image, target
+
+from torch import nn
+from einops.layers.torch import Rearrange
+from torch import Tensor
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels = 3, patch_size = 8, emb_size = 128):
+        self.patch_size = patch_size
+        super().__init__()
+        self.projection = nn.Sequential(
+            # break-down the image in s1 x s2 patches and flat them
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size),
+            nn.Linear(patch_size * patch_size * in_channels, emb_size)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.projection(x)
+        return x
+
 from einops import rearrange
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=8, dropout=0.1):
-        super(Attention, self).__init__()
-        self.heads = heads
-        self.scale = dim ** -0.5
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.to_out = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
+    def __init__(self, dim, n_heads, dropout):
+        super().__init__()
+        self.n_heads = n_heads
+        self.att = torch.nn.MultiheadAttention(embed_dim=dim,
+                                               num_heads=n_heads,
+                                               dropout=dropout)
+        self.q = torch.nn.Linear(dim, dim)
+        self.k = torch.nn.Linear(dim, dim)
+        self.v = torch.nn.Linear(dim, dim)
 
     def forward(self, x):
-        b, n, _, h = *x.shape, self.heads
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
+        q = self.q(x)
+        k = self.k(x)
+        v = self.v(x)
+        attn_output, attn_output_weights = self.att(q, k , v)
+        return attn_output
 
-        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        attn = dots.softmax(dim=-1)
-        attn = self.dropout(attn)
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
 
-        out = torch.einsum('bhij,bhjd->bhid', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
 
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.1):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, dim)
-        self.dropout = nn.Dropout(dropout)
+class FeedForward(nn.Sequential):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
 
-    def forward(self, x):
-        x = F.gelu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
+class ResidualAdd(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        res = x
+        x = self.fn(x, **kwargs)
+        x += res
         return x
 
-class ViTBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_dim, dropout=0.1):
-        super(ViTBlock, self).__init__()
-        self.attention = Attention(dim, heads=num_heads, dropout=dropout)
-        self.mlp = MLP(dim, mlp_dim, dropout=dropout)
+from einops import repeat
 
-    def forward(self, x):
-        x = x + self.attention(x)
-        x = x + self.mlp(x)
-        return x
+class ViT(nn.Module):
+    def __init__(self, ch=3, img_size=144, patch_size=8, emb_dim=32, n_layers=4, out_dim=37, dropout=0.1, heads=2):
+        super(ViT, self).__init__()
 
-class VisionTransformer(nn.Module):
-    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1):
-        super(VisionTransformer, self).__init__()
-        assert image_size % patch_size == 0, "image dimensions must be divisible by the patch size"
-        num_patches = (image_size // patch_size) ** 2
-        patch_dim = channels * patch_size ** 2
-        self.patch_embedding = nn.Conv2d(in_channels=channels, out_channels=dim, kernel_size=patch_size, stride=patch_size)
-        self.positional_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(dropout)
-        self.transformer = nn.Sequential(*[ViTBlock(dim, heads, mlp_dim, dropout) for _ in range(depth)])
-        self.to_cls_token = nn.Identity()
-        self.fc = nn.Linear(dim, num_classes)
+        # Attributes
+        self.channels = ch
+        self.height = img_size
+        self.width = img_size
+        self.patch_size = patch_size
+        self.n_layers = n_layers
 
-    def forward(self, x):
-        p = self.patch_embedding(x)
-        b, _, _, _ = p.shape
-        p = rearrange(p, 'b d h w -> b (h w) d')
-        cls_tokens = self.cls_token.expand(b, -1, -1)
-        x = torch.cat((cls_tokens, p), dim=1)
-        x += self.positional_embedding
-        x = self.dropout(x)
-        x = self.transformer(x)
-        x = self.to_cls_token(x[:, 0])
-        return self.fc(x)
+        # Patching
+        self.patch_embedding = PatchEmbedding(in_channels=ch, patch_size=patch_size, emb_size=emb_dim)
+
+        # Learnable params
+        num_patches = (img_size // patch_size) ** 2
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, emb_dim))
+        self.cls_token = nn.Parameter(torch.rand(1, 1, emb_dim))
+
+        # Transformer Encoder
+        self.layers = nn.ModuleList([])
+        for _ in range(n_layers):
+            transformer_block = nn.Sequential(
+                ResidualAdd(PreNorm(emb_dim, Attention(emb_dim, n_heads = heads, dropout = dropout))),
+                ResidualAdd(PreNorm(emb_dim, FeedForward(emb_dim, emb_dim, dropout = dropout))),
+            )
+            self.layers.append(transformer_block)
+
+        # Classification head
+        self.head = nn.Sequential(nn.LayerNorm(emb_dim), nn.Linear(emb_dim, out_dim))
+
+    def forward(self, img):
+        # Get patch embedding vectors
+        x = self.patch_embedding(img)
+        b, n, _ = x.shape
+
+        # Add cls token to inputs
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+
+        # Transforms layers
+        for i in range(self.n_layers):
+            x = self.layers[i](x)
+
+        # Output based on classification token
+        return self.head(x[:, 0, :])
 
 import torch
-import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
+from torchvision.transforms import Compose, ToTensor
+from torch.utils.data.dataset import random_split
+from tqdm import tqdm
 
-# Define transformations for preprocessing
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),  # Resize images to 224x224
-    transforms.ToTensor(),           # Convert images to tensors
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize with ImageNet mean and std
+# Define data transformations
+transform = Compose([
+    Resize((144, 144)),
+    ToTensor(),
 ])
 
-# Load the dataset
-dataset = ImageFolder(root='./content', transform=transform)
+# Load data
+dataset = ImageFolder(root="./content", transform=transform)
 
-# Define data loader
-batch_size = 32
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+# Split dataset into train and validation sets
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-# Instantiate the VisionTransformer model
-image_size = 224  # Assuming resized images are 224x224
-patch_size = 16   # Patch size used in the ViT model
-num_classes = len(dataset.classes)  # Number of classes in the dataset
-dim = 512         # Dimension of the embeddings
-depth = 6         # Number of transformer blocks
-heads = 8         # Number of attention heads
-mlp_dim = 1024    # Dimension of the feedforward layers
-vit_model = VisionTransformer(image_size, patch_size, num_classes, dim, depth, heads, mlp_dim)
+# Define dataloaders
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-# Define optimizer and loss function
-optimizer = torch.optim.Adam(vit_model.parameters(), lr=1e-4)
-criterion = torch.nn.CrossEntropyLoss()
+# Instantiate ViT model
+model = ViT()
 
-# Training loop
+# Define loss function
+criterion = nn.CrossEntropyLoss()
+
+# Define optimizer
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
 num_epochs = 10
 for epoch in range(num_epochs):
-    vit_model.train()
-    for images, labels in data_loader:
+    model.train()
+    train_loss = 0.0
+    for images, labels in tqdm(train_loader):
         optimizer.zero_grad()
-        outputs = vit_model(images)
+        outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
-    break
+        train_loss += loss.item() * images.size(0)
+    train_loss /= len(train_loader.dataset)
 
-import torch
-import torch.nn.functional as F
+    # Validation loop
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in tqdm(val_loader):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    val_loss /= len(val_loader.dataset)
+    val_acc = correct / total
+
+    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+# Save the trained model if needed
+torch.save(model.state_dict(), "vit_model.pth")
+
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# Assuming you have already loaded your model and dataset
-# Also assuming you have defined your criterion (loss function)
-
-# Set model to evaluation mode
-vit_model.eval()
-
-# Initialize lists to store predictions and labels
-all_predictions = []
-all_labels = []
-
-# Iterate over the dataset
+# Validation loop
+model.eval()
+val_loss = 0.0
+y_true = []
+y_pred = []
 with torch.no_grad():
-    for images, labels in data_loader:
-        # Forward pass
-        outputs = vit_model(images)
+    for images, labels in tqdm(val_loader):
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        val_loss += loss.item() * images.size(0)
         _, predicted = torch.max(outputs, 1)
+        y_true.extend(labels.tolist())
+        y_pred.extend(predicted.tolist())
+val_loss /= len(val_loader.dataset)
 
-        # Store predictions and labels
-        all_predictions.extend(predicted.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+# Calculate metrics
+accuracy = accuracy_score(y_true, y_pred)
+precision = precision_score(y_true, y_pred, average='macro')  # You can change the average parameter if needed
+recall = recall_score(y_true, y_pred, average='macro')  # You can change the average parameter if needed
+f1 = f1_score(y_true, y_pred, average='macro')  # You can change the average parameter if needed
 
-# Compute metrics
-accuracy = accuracy_score(all_labels, all_predictions)
-precision = precision_score(all_labels, all_predictions, average='macro')
-recall = recall_score(all_labels, all_predictions, average='macro')
-f1 = f1_score(all_labels, all_predictions, average='macro')
-
-# Print metrics
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"F1 Score: {f1:.4f}")
+print(f"Validation Loss: {val_loss:.4f}, Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}")
 
